@@ -20,10 +20,10 @@
             <default>#888888</default>
         </entry>
         <entry name="unknownColor" type="Color">
-            <default>#3daee9</default>
+            <default>#ffaa00</default>
         </entry>
         <entry name="resumingColor" type="Color">
-            <default>#ffaa00</default>
+            <default>#3daee9</default>
         </entry>
     </group>
 </kcfg>

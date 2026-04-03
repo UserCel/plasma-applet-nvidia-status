@@ -17,8 +17,8 @@ PlasmoidItem {
         const cfg = plasmoid.configuration;
         if (status === "active") return cfg.activeColor || "#76b900";
         if (status === "suspended") return cfg.suspendedColor || "#888888";
-        if (status === "resuming" || status === "suspending") return cfg.resumingColor || "#ffaa00";
-        return cfg.unknownColor || Kirigami.Theme.highlightColor;
+        if (status === "resuming" || status === "suspending") return cfg.resumingColor || "#3daee9";
+        return cfg.unknownColor || "#ffaa00";
     }
 
     // --- Tooltip ---

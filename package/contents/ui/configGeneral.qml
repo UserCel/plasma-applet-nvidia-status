@@ -16,8 +16,8 @@ Kirigami.FormLayout {
     // Color properties bound manually
     property color cfg_activeColor: "#76b900"
     property color cfg_suspendedColor: "#888888"
-    property color cfg_unknownColor: "#3daee9"
-    property color cfg_resumingColor: "#ffaa00"
+    property color cfg_unknownColor: "#ffaa00"
+    property color cfg_resumingColor: "#3daee9"
 
     // Internal GPU detection state
     property var gpuList: []
@@ -170,8 +170,8 @@ Kirigami.FormLayout {
         onClicked: {
             page.cfg_activeColor = "#76b900";
             page.cfg_suspendedColor = "#888888";
-            page.cfg_unknownColor = "#3daee9";
-            page.cfg_resumingColor = "#ffaa00";
+            page.cfg_unknownColor = "#ffaa00";
+            page.cfg_resumingColor = "#3daee9";
         }
     }
 
