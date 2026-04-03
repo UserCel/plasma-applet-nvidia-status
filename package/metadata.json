@@ -3,7 +3,6 @@
     "KPlugin": {
         "Authors": [
             {
-                "Email": "",
                 "Name": "Ido Haim"
             }
         ],
@@ -14,7 +13,8 @@
         "Icon": "utilities-system-monitor",
         "License": "GPL-3.0+",
         "Name": "NVIDIA Status",
-        "Version": "1.0.2"
+        "Version": "1.0.2",
+        "Website": "https://github.com/UserCel/plasma-applet-nvidia-status/"
     },
     "X-Plasma-API-Minimum-Version": "6.0",
     "X-Plasma-Provides": [
