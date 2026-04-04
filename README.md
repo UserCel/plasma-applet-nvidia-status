@@ -1,6 +1,6 @@
 # NVIDIA Status
 <img src="screenshot.png" width="500" alt="NVIDIA Status Screenshot">
-<img src="screenshot2.png" width="500" alt="NVIDIA Status Screenshot 2">
+<img src="screenshot2.png" width="250" alt="NVIDIA Status Screenshot 2">
 
 A premium KDE Plasma 6 widget to monitor your NVIDIA dGPU power state and active processes at a glance.
 
