@@ -47,7 +47,9 @@ PlasmoidItem {
     readonly property string getProcessCmd: root.nvidiaSmiPath + " pmon -c 1" + root.smiTarget + "; echo \"---PROCESSES---\"; " + root.nvidiaSmiPath + root.smiTarget + "; echo \"---TELEMETRY---\"; " + root.nvidiaSmiPath + root.smiTarget + " --query-gpu=memory.used,memory.total,temperature.gpu,power.draw --format=csv,noheader,nounits"
     property bool showGpuModel: plasmoid.configuration && plasmoid.configuration.showGpuModel !== undefined ? plasmoid.configuration.showGpuModel : true
     property string gpuModelName: ""
-    readonly property string configuredPciAddress: (plasmoid.configuration && plasmoid.configuration.pciAddress) ? String(plasmoid.configuration.pciAddress).trim().toLowerCase() : "0000:01:00.0"
+    property string detectedPciAddress: ""
+    readonly property string rawConfiguredPciAddress: (plasmoid.configuration && plasmoid.configuration.pciAddress) ? root.normalizePciAddress(plasmoid.configuration.pciAddress) : "0000:01:00.0"
+    readonly property string configuredPciAddress: root.detectedPciAddress || root.rawConfiguredPciAddress || "0000:01:00.0"
     readonly property string shortPciAddress: {
         const addr = root.configuredPciAddress;
         return addr.replace(/^0000:/, "");
@@ -60,14 +62,85 @@ PlasmoidItem {
     readonly property int maxCooldownTicks: 3
     property double lastSmiQueryTime: 0
 
+    onRawConfiguredPciAddressChanged: {
+        if (root.detectedPciAddress && root.detectedPciAddress !== root.rawConfiguredPciAddress) {
+            root.detectedPciAddress = "";
+        }
+        root.refreshGpuIdentity();
+    }
+
+    onConfiguredPciAddressChanged: {
+        const addr = root.configuredPciAddress;
+        if (!addr) return;
+        gpuStatusSource.disconnectSource("cat /sys/bus/pci/devices/" + addr + "/power/runtime_status");
+        gpuStatusSource.connectSource("cat /sys/bus/pci/devices/" + addr + "/power/runtime_status");
+        if (root.isViewActive && root.status === "active" && root.hasNvidiaSmi) {
+            gpuProcessesSource.disconnectSource(root.getProcessCmd);
+            gpuProcessesSource.connectSource(root.getProcessCmd);
+        }
+    }
+
+    function normalizePciAddress(raw) {
+        if (!raw) return "";
+        let s = String(raw).trim().toLowerCase();
+        s = s.split(/\s+/)[0].replace(/:$/, "");
+        s = s.replace(/^([0-9a-f]{4,8}:[0-9a-f]{2})\.([0-9a-f]{2}\.[0-9a-f])$/, "$1:$2");
+        s = s.replace(/^([0-9a-f]{2})\.([0-9a-f]{2}\.[0-9a-f])$/, "$1:$2");
+        s = s.replace(/^0000([0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f])$/, "$1");
+        if (/^[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]$/.test(s)) {
+            s = "0000:" + s;
+        }
+        return s;
+    }
+
     function cleanGpuModelName(raw) {
         if (!raw) return "";
         return raw.replace(/^NVIDIA\s+/i, "")
                   .replace(/^GeForce\s+/i, "")
                   .replace(/\s+Laptop\s+GPU/i, "")
                   .replace(/\s+with\s+Max-Q\s+Design/i, " Max-Q")
+                  .replace(/\s+Max-Q\s*\/\s*Mobile/i, "")
                   .replace(/\s+GPU$/i, "")
                   .trim();
+    }
+
+    function buildGpuDetectCmd(preferredAddr) {
+        const addr = root.normalizePciAddress(preferredAddr) || "0000:01:00.0";
+        return "addr=\"" + addr + "\"; " +
+            "if [ ! -d \"/proc/driver/nvidia/gpus/$addr\" ] && [ ! -e \"/sys/bus/pci/drivers/nvidia/$addr\" ]; then " +
+            "  for d in /proc/driver/nvidia/gpus/0000:* /sys/bus/pci/drivers/nvidia/0000:*; do " +
+            "    if [ -e \"$d\" ]; then addr=$(basename \"$d\"); break; fi; " +
+            "  done; " +
+            "  if [ ! -d \"/proc/driver/nvidia/gpus/$addr\" ] && [ ! -e \"/sys/bus/pci/drivers/nvidia/$addr\" ]; then " +
+            "    lspci_addr=$(lspci -d 10de:: -D 2>/dev/null | grep -E 'VGA|3D' | head -n 1 | awk '{print $1}'); " +
+            "    [ -n \"$lspci_addr\" ] && addr=\"$lspci_addr\"; " +
+            "  fi; " +
+            "fi; " +
+            "echo \"ADDR=$addr\"; " +
+            "model=$(grep -s '^Model:' \"/proc/driver/nvidia/gpus/$addr/information\" 2>/dev/null | sed 's/Model:[ \\t]*//'); " +
+            "[ -z \"$model\" ] && model=$(lspci -s \"$addr\" 2>/dev/null | sed -n 's/.*\\[\\(.*\\)\\].*/\\1/p'); " +
+            "echo \"MODEL=$model\"";
+    }
+
+    function parseGpuDetectOutput(stdout) {
+        const result = { address: "", model: "" };
+        if (!stdout) return result;
+        const lines = String(stdout).split(/\r?\n/);
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i].trim();
+            if (line.indexOf("ADDR=") === 0) {
+                result.address = root.normalizePciAddress(line.substring(5));
+            } else if (line.indexOf("MODEL=") === 0) {
+                result.model = root.cleanGpuModelName(line.substring(6));
+            }
+        }
+        return result;
+    }
+
+    function refreshGpuIdentity() {
+        const cmd = root.buildGpuDetectCmd(root.rawConfiguredPciAddress);
+        gpuModelSource.disconnectSource(cmd);
+        gpuModelSource.connectSource(cmd);
     }
 
     function formatVramMb(mb) {
@@ -822,6 +895,10 @@ PlasmoidItem {
                 root.baselineFuserPids = [];
             } else if (result === "active") {
                 root.statusText = i18n("Active (D0)");
+                if (oldStatus !== "active" && root.isViewActive && root.hasNvidiaSmi) {
+                    gpuProcessesSource.disconnectSource(root.getProcessCmd);
+                    gpuProcessesSource.connectSource(root.getProcessCmd);
+                }
             } else if (result === "resuming") {
                 root.statusText = i18n("Resuming...");
             } else if (result === "suspending") {
@@ -844,6 +921,10 @@ PlasmoidItem {
                 const discoveredPath = stdout.trim();
                 if (discoveredPath.length > 0) {
                     root.nvidiaSmiPath = discoveredPath;
+                    if (root.isViewActive && root.status === "active") {
+                        gpuProcessesSource.disconnectSource(root.getProcessCmd);
+                        gpuProcessesSource.connectSource(root.getProcessCmd);
+                    }
                 }
             } else {
                 const partsOut = stdout.split("---TELEMETRY---");
@@ -1078,16 +1159,20 @@ PlasmoidItem {
         connectedSources: []
         onNewData: function(sourceName, data) {
             disconnectSource(sourceName);
-            const stdout = (data["stdout"] || "").trim();
-            if (stdout) {
-                root.gpuModelName = root.cleanGpuModelName(stdout);
+            const parsed = root.parseGpuDetectOutput(data["stdout"] || "");
+            root.gpuModelName = parsed.model || "";
+            if (parsed.address) {
+                root.detectedPciAddress = parsed.address;
+                if (plasmoid.configuration && (!plasmoid.configuration.pciAddress || root.normalizePciAddress(plasmoid.configuration.pciAddress) === "0000:01:00.0") && parsed.address !== "0000:01:00.0") {
+                    plasmoid.configuration.pciAddress = parsed.address;
+                }
             }
         }
     }
 
     Component.onCompleted: {
-        // Fetch GPU model passively from sysfs/proc (zero wake)
-        gpuModelSource.connectSource("grep -s '^Model:' /proc/driver/nvidia/gpus/" + root.configuredPciAddress + "/information 2>/dev/null | sed 's/Model:[ \t]*//'");
+        // Resolve valid NVIDIA PCI address and fetch GPU model passively from sysfs/proc (zero wake)
+        root.refreshGpuIdentity();
         // Search in common system paths, user path, and then system-wide which
         gpuProcessesSource.connectSource("for p in /usr/bin/nvidia-smi /usr/local/bin/nvidia-smi ~/.local/bin/nvidia-smi; do [ -x \"$p\" ] && echo \"$p\" && exit 0; done; which nvidia-smi");
         steamAppsSource.connectSource("echo \"HOME=$HOME\"; grep -hE '\"appid\"|\"name\"|\"installdir\"' ~/.local/share/Steam/steamapps/appmanifest_*.acf ~/.steam/root/steamapps/appmanifest_*.acf ~/.steam/steam/steamapps/appmanifest_*.acf 2>/dev/null");

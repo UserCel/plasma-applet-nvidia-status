@@ -15,6 +15,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Run tests
+        run: python3 tests/test_applet.py
+
       - name: Extract version and metadata
         id: metadata
         run: |

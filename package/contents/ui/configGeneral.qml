@@ -84,6 +84,46 @@ ScrollView {
             onAccepted: page.cfg_resumingColor = selectedColor
         }
 
+        function normalizePciAddress(raw) {
+            if (!raw) return "";
+            let s = String(raw).trim().toLowerCase();
+            s = s.split(/\s+/)[0].replace(/:$/, "");
+            s = s.replace(/^([0-9a-f]{4,8}:[0-9a-f]{2})\.([0-9a-f]{2}\.[0-9a-f])$/, "$1:$2");
+            s = s.replace(/^([0-9a-f]{2})\.([0-9a-f]{2}\.[0-9a-f])$/, "$1:$2");
+            s = s.replace(/^0000([0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f])$/, "$1");
+            if (/^[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]$/.test(s)) {
+                s = "0000:" + s;
+            }
+            return s;
+        }
+
+        function parseDetectedGpus(output) {
+            const foundItems = [];
+            if (!output) return foundItems;
+            const lines = String(output).trim().split(/\n+/);
+            for (let line of lines) {
+                if (!line.trim()) continue;
+                const addr = page.normalizePciAddress(line.split(" ")[0]);
+                const match = line.match(/\[(.*?)\]/);
+                const modelName = match ? match[1] : line.substring(line.indexOf(":") + 1).replace("NVIDIA Corporation", "").trim();
+                foundItems.push({ "address": addr, "display": addr + ": " + modelName });
+            }
+            return foundItems;
+        }
+
+        function resolveSelectedGpu(foundItems, currentText) {
+            const normalizedCurrent = page.normalizePciAddress(currentText);
+            if (!foundItems || foundItems.length === 0) {
+                return { index: -1, address: normalizedCurrent || currentText };
+            }
+            for (let i = 0; i < foundItems.length; i++) {
+                if (foundItems[i].address === normalizedCurrent) {
+                    return { index: i, address: foundItems[i].address };
+                }
+            }
+            return { index: 0, address: foundItems[0].address };
+        }
+
         // --- GPU Detection DataSource ---
         Plasma5Support.DataSource {
             id: detectionSource
@@ -91,19 +131,16 @@ ScrollView {
             connectedSources: []
             onNewData: function(sourceName, data) {
                 const output = data["stdout"] ? data["stdout"].trim() : "";
-                const foundItems = [];
-                if (output) {
-                    const lines = output.split(/\n+/);
-                    for (let line of lines) {
-                        if (!line.trim()) continue;
-                        const addr = line.split(" ")[0];
-                        const match = line.match(/\[(.*?)\]/);
-                        const modelName = match ? match[1] : line.substring(line.indexOf(":") + 1).replace("NVIDIA Corporation", "").trim();
-                        foundItems.push({ "address": addr, "display": addr + ": " + modelName });
-                    }
-                }
+                const foundItems = page.parseDetectedGpus(output);
                 page.gpuList = foundItems;
                 page.searching = false;
+                const resolved = page.resolveSelectedGpu(foundItems, pciAddressField.text);
+                if (resolved.index >= 0) {
+                    gpuCombo.currentIndex = resolved.index;
+                    if (pciAddressField.text !== resolved.address) {
+                        pciAddressField.text = resolved.address;
+                    }
+                }
                 detectionSource.disconnectSource(sourceName);
             }
         }
@@ -320,6 +357,18 @@ ScrollView {
                 id: pciAddressField
                 Layout.fillWidth: true
                 placeholderText: "0000:01:00.0"
+                onEditingFinished: {
+                    const norm = page.normalizePciAddress(text);
+                    if (norm && norm !== text) {
+                        text = norm;
+                    }
+                    for (let i = 0; i < page.gpuList.length; i++) {
+                        if (page.gpuList[i].address === norm) {
+                            gpuCombo.currentIndex = i;
+                            break;
+                        }
+                    }
+                }
             }
 
             Button {
