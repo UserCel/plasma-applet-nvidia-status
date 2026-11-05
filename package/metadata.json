@@ -13,7 +13,7 @@
         "Icon": "utilities-system-monitor",
         "License": "GPL-3.0+",
         "Name": "NVIDIA Status",
-        "Version": "1.0.7",
+        "Version": "1.0.8-dev",
         "Website": "https://github.com/UserCel/plasma-applet-nvidia-status/"
     },
     "X-Plasma-API-Minimum-Version": "6.0",
