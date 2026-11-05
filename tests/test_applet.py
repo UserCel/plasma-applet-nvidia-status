@@ -15,6 +15,11 @@ METADATA_JSON = REPO_ROOT / "package" / "metadata.json"
 
 
 def extract_js_function(qml_text: str, func_name: str) -> str:
+    """
+    Extract a JavaScript function from QML source using a lexical state machine
+    that skips braces inside single/double/template strings, single/multi-line
+    comments, and regular expression literals (such as /\\d{4}/).
+    """
     pattern = re.compile(rf"\bfunction\s+{re.escape(func_name)}\s*\([^)]*\)\s*\{{")
     match = pattern.search(qml_text)
     if not match:
@@ -22,13 +27,77 @@ def extract_js_function(qml_text: str, func_name: str) -> str:
     start = match.start()
     brace_idx = match.end() - 1
     depth = 0
-    for i in range(brace_idx, len(qml_text)):
-        if qml_text[i] == "{":
+    i = brace_idx
+    n = len(qml_text)
+    prev_sig_char = "{"
+
+    while i < n:
+        ch = qml_text[i]
+        nxt = qml_text[i + 1] if i + 1 < n else ""
+
+        # 1. Single-line comment //
+        if ch == "/" and nxt == "/":
+            i += 2
+            while i < n and qml_text[i] != "\n":
+                i += 1
+            continue
+
+        # 2. Multi-line comment /* ... */
+        if ch == "/" and nxt == "*":
+            i += 2
+            while i + 1 < n and not (qml_text[i] == "*" and qml_text[i + 1] == "/"):
+                i += 1
+            i += 2
+            continue
+
+        # 3. String or template literals ('...', "...", `...`)
+        if ch in ("'", '"', "`"):
+            quote = ch
+            i += 1
+            while i < n:
+                if qml_text[i] == "\\":
+                    i += 2
+                    continue
+                if qml_text[i] == quote:
+                    i += 1
+                    break
+                i += 1
+            prev_sig_char = quote
+            continue
+
+        # 4. Regex literal /.../
+        if ch == "/" and prev_sig_char in ("(", ",", "=", ":", "[", "!", "&", "|", "?", "{", "}", ";", "\n"):
+            i += 1
+            in_char_class = False
+            while i < n:
+                if qml_text[i] == "\\":
+                    i += 2
+                    continue
+                if qml_text[i] == "[":
+                    in_char_class = True
+                elif qml_text[i] == "]":
+                    in_char_class = False
+                elif qml_text[i] == "/" and not in_char_class:
+                    i += 1
+                    while i < n and qml_text[i].isalpha():
+                        i += 1
+                    break
+                i += 1
+            prev_sig_char = "/"
+            continue
+
+        # 5. Structural braces
+        if ch == "{":
             depth += 1
-        elif qml_text[i] == "}":
+        elif ch == "}":
             depth -= 1
             if depth == 0:
                 return qml_text[start : i + 1]
+
+        if not ch.isspace():
+            prev_sig_char = ch
+        i += 1
+
     raise ValueError(f"Unbalanced braces in function {func_name}")
 
 
@@ -54,8 +123,32 @@ class TestNvidiaStatusApplet(unittest.TestCase):
         return json.loads(res.stdout.strip())
 
     # =========================================================================
-    # Metadata and QML Synchronization Tests
+    # Tokenizer, Metadata & QML Synchronization Tests
     # =========================================================================
+
+    def test_extract_js_function_tokenizer_handles_braces_in_strings_and_regex(self):
+        """Ensure extract_js_function ignores unbalanced braces in regexes, strings, and comments."""
+        sample_qml = r"""
+        function trickyFunction(x) {
+            // Unbalanced brace in comment: {
+            /* Another unbalanced brace: }}} */
+            const re = /^([0-9a-f]{4,8}:[0-9a-f]{2})$/;
+            const str = "unbalanced } in string {";
+            return re.test(x) ? str : "";
+        }
+        """
+        extracted = extract_js_function(sample_qml, "trickyFunction")
+        res = self.run_node_json(
+            f"""
+            {extracted}
+            console.log(JSON.stringify({{
+                matched: trickyFunction("0000:02"),
+                unmatched: trickyFunction("invalid")
+            }}));
+            """
+        )
+        self.assertEqual(res["matched"], "unbalanced } in string {")
+        self.assertEqual(res["unmatched"], "")
 
     def test_config_qml_files_in_sync(self):
         """Ensure both configGeneral.qml copies remain 100% identical."""
@@ -72,99 +165,110 @@ class TestNvidiaStatusApplet(unittest.TestCase):
         self.assertRegex(version, r"^\d+\.\d+\.\d+(-[a-zA-Z0-9.]+)?$")
 
     # =========================================================================
-    # Issue #3 & PR #4: Multi-GPU Tests
+    # Issue #3 & PR #4: Multi-GPU Tests (100% extracted from main.qml)
     # =========================================================================
 
     def test_multi_gpu_command_scoping_and_pmon_syntax(self):
         """
-        Verify Issue #3 / PR #4 fix:
+        Verify Issue #3 / PR #4 fix by calling main.qml's actual buildProcessCmd():
         On multi-GPU systems (e.g. 2x RTX 5060 Ti at 0000:04:00.0 and 0000:2b:00.0):
-        1. smiTarget must be '-i <addr>'
-        2. In getProcessCmd, the -i flag MUST come after 'pmon -c 1'
+        1. In buildProcessCmd, the -i flag MUST come after 'pmon -c 1'
            (since 'nvidia-smi -i <addr> pmon' fails with 'Option pmon is not recognized')
-        3. Telemetry and standard nvidia-smi queries must be scoped to that card
-        4. Two instances for different cards produce completely isolated commands
+        2. Telemetry and standard nvidia-smi queries must be scoped to that card
+        3. Two instances for different cards produce completely isolated commands
         """
         normalize_fn = extract_js_function(self.main_qml_text, "normalizePciAddress")
+        build_proc_cmd_fn = extract_js_function(self.main_qml_text, "buildProcessCmd")
 
         js_harness = f"""
         const root = {{}};
         {normalize_fn}
+        {build_proc_cmd_fn}
         root.normalizePciAddress = normalizePciAddress;
-        root.nvidiaSmiPath = "/usr/bin/nvidia-smi";
+        root.buildProcessCmd = buildProcessCmd;
 
-        function makeInstance(pciAddr) {{
-            const normalized = root.normalizePciAddress(pciAddr);
-            const smiTarget = normalized ? " -i " + normalized : "";
-            const getProcessCmd = root.nvidiaSmiPath + " pmon -c 1" + smiTarget +
-                "; echo \\"---PROCESSES---\\"; " + root.nvidiaSmiPath + smiTarget +
-                "; echo \\"---TELEMETRY---\\"; " + root.nvidiaSmiPath + smiTarget +
-                " --query-gpu=memory.used,memory.total,temperature.gpu,power.draw --format=csv,noheader,nounits";
-            const shortPciAddress = normalized.replace(/^0000:/, "");
-            return {{ normalized, smiTarget, getProcessCmd, shortPciAddress }};
-        }}
+        const cmd0 = buildProcessCmd("/usr/bin/nvidia-smi", "0000:04:00.0");
+        const cmd1 = buildProcessCmd("/usr/bin/nvidia-smi", "0000:2B:00.0"); // uppercase hex input
 
-        const gpu0 = makeInstance("0000:04:00.0");
-        const gpu1 = makeInstance("0000:2B:00.0"); // test uppercase hex input too
-
-        console.log(JSON.stringify({{ gpu0, gpu1 }}));
+        console.log(JSON.stringify({{ cmd0, cmd1 }}));
         """
         res = self.run_node_json(js_harness)
-        gpu0 = res["gpu0"]
-        gpu1 = res["gpu1"]
+        cmd0 = res["cmd0"]
+        cmd1 = res["cmd1"]
 
         # Card 0 verification
-        self.assertEqual(gpu0["normalized"], "0000:04:00.0")
-        self.assertEqual(gpu0["smiTarget"], " -i 0000:04:00.0")
-        self.assertEqual(gpu0["shortPciAddress"], "04:00.0")
-        self.assertIn("pmon -c 1 -i 0000:04:00.0;", gpu0["getProcessCmd"])
-        self.assertNotIn("-i 0000:04:00.0 pmon", gpu0["getProcessCmd"])
-        self.assertIn("/usr/bin/nvidia-smi -i 0000:04:00.0 --query-gpu=", gpu0["getProcessCmd"])
+        self.assertIn("/usr/bin/nvidia-smi pmon -c 1 -i 0000:04:00.0;", cmd0)
+        self.assertNotIn("-i 0000:04:00.0 pmon", cmd0)
+        self.assertIn("/usr/bin/nvidia-smi -i 0000:04:00.0;", cmd0)
+        self.assertIn("/usr/bin/nvidia-smi -i 0000:04:00.0 --query-gpu=", cmd0)
 
         # Card 1 verification (ensuring hex lowercase normalization: 2B -> 2b)
-        self.assertEqual(gpu1["normalized"], "0000:2b:00.0")
-        self.assertEqual(gpu1["smiTarget"], " -i 0000:2b:00.0")
-        self.assertEqual(gpu1["shortPciAddress"], "2b:00.0")
-        self.assertIn("pmon -c 1 -i 0000:2b:00.0;", gpu1["getProcessCmd"])
-        self.assertNotIn("-i 0000:2b:00.0 pmon", gpu1["getProcessCmd"])
-        self.assertIn("/usr/bin/nvidia-smi -i 0000:2b:00.0 --query-gpu=", gpu1["getProcessCmd"])
+        self.assertIn("/usr/bin/nvidia-smi pmon -c 1 -i 0000:2b:00.0;", cmd1)
+        self.assertNotIn("-i 0000:2b:00.0 pmon", cmd1)
+        self.assertIn("/usr/bin/nvidia-smi -i 0000:2b:00.0;", cmd1)
+        self.assertIn("/usr/bin/nvidia-smi -i 0000:2b:00.0 --query-gpu=", cmd1)
 
         # Complete isolation check
-        self.assertNotEqual(gpu0["getProcessCmd"], gpu1["getProcessCmd"])
-        self.assertNotIn("04:00.0", gpu1["getProcessCmd"])
-        self.assertNotIn("2b:00.0", gpu0["getProcessCmd"])
+        self.assertNotEqual(cmd0, cmd1)
+        self.assertNotIn("04:00.0", cmd1)
+        self.assertNotIn("2b:00.0", cmd0)
 
     def test_multi_gpu_device_minor_fuser_resolution(self):
         """
-        Verify multi-GPU device minor resolution (commit 6276e67).
-        On multi-GPU systems, GPU 1 is mapped to /dev/nvidia1 (Device Minor: 1).
-        fuserCmd must dynamically query Device Minor for the configured card
-        and target /dev/nvidia1 instead of hardcoded /dev/nvidia0.
+        Verify multi-GPU device minor resolution (commit 6276e67) by calling
+        main.qml's actual buildFuserCmd() and executing its shell pipeline against
+        mocked /proc/driver/nvidia/gpus and /dev/nvidia* nodes.
         """
+        normalize_fn = extract_js_function(self.main_qml_text, "normalizePciAddress")
+        build_fuser_cmd_fn = extract_js_function(self.main_qml_text, "buildFuserCmd")
+
+        cmds = self.run_node_json(
+            f"""
+            const root = {{}};
+            {normalize_fn}
+            {build_fuser_cmd_fn}
+            root.normalizePciAddress = normalizePciAddress;
+            root.buildFuserCmd = buildFuserCmd;
+            console.log(JSON.stringify({{
+                gpu0: buildFuserCmd("0000:04:00.0"),
+                gpu1: buildFuserCmd("0000:2B:00.0"),
+                missing: buildFuserCmd("0000:99:00.0")
+            }}));
+            """
+        )
+
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             gpu0_info = tmp / "proc" / "driver" / "nvidia" / "gpus" / "0000:04:00.0"
             gpu1_info = tmp / "proc" / "driver" / "nvidia" / "gpus" / "0000:2b:00.0"
+            dev_dir = tmp / "dev"
             gpu0_info.mkdir(parents=True)
             gpu1_info.mkdir(parents=True)
+            dev_dir.mkdir(parents=True)
+
             (gpu0_info / "information").write_text("Model: RTX 5060 Ti\nDevice Minor: 0\n", encoding="utf-8")
             (gpu1_info / "information").write_text("Model: RTX 5060 Ti\nDevice Minor: 1\n", encoding="utf-8")
+            (dev_dir / "nvidia0").write_text("", encoding="utf-8")
+            (dev_dir / "nvidia1").write_text("", encoding="utf-8")
 
-            # Shell snippet matching main.qml's fuserCmd
-            def resolve_dev(addr):
-                cmd = (
-                    f"dev=\"/dev/nvidia$(grep -s 'Device Minor:' {tmp}/proc/driver/nvidia/gpus/{addr}/information 2>/dev/null | awk '{{print $NF}}')\"; "
-                    "[ -e \"$dev\" ] || dev=\"/dev/nvidia0\"; echo \"$dev\""
+            def run_fuser_cmd(raw_cmd: str) -> str:
+                # Redirect paths to mocked root and replace 'fuser' with 'echo' to inspect resolved args
+                sandboxed = (
+                    raw_cmd.replace("/proc/driver/nvidia/gpus", f"{tmp}/proc/driver/nvidia/gpus")
+                    .replace("/dev/nvidia", f"{tmp}/dev/nvidia")
+                    .replace("fuser ", "echo ")
                 )
-                res = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, check=True)
-                # Note: /dev/nvidia1 won't exist in tmp, so let's verify what grep extracted:
-                minor_cmd = f"grep -s 'Device Minor:' {tmp}/proc/driver/nvidia/gpus/{addr}/information | awk '{{print $NF}}'"
-                minor = subprocess.run(["sh", "-c", minor_cmd], capture_output=True, text=True, check=True).stdout.strip()
-                return minor
+                res = subprocess.run(["sh", "-c", sandboxed], capture_output=True, text=True, check=True)
+                return res.stdout.strip()
 
-            self.assertEqual(resolve_dev("0000:04:00.0"), "0")
-            self.assertEqual(resolve_dev("0000:2b:00.0"), "1")
-            self.assertEqual(resolve_dev("0000:99:00.0"), "")
+            out0 = run_fuser_cmd(cmds["gpu0"])
+            out1 = run_fuser_cmd(cmds["gpu1"])
+            out_missing = run_fuser_cmd(cmds["missing"])
+
+            self.assertTrue(out0.startswith(f"{tmp}/dev/nvidia0 "))
+            self.assertTrue(out1.startswith(f"{tmp}/dev/nvidia1 "))
+            # When PCI address has no proc entry, falls back to /dev/nvidia0
+            self.assertTrue(out_missing.startswith(f"{tmp}/dev/nvidia0 "))
 
     def test_multi_gpu_config_detection_and_selection(self):
         """
@@ -250,15 +354,10 @@ class TestNvidiaStatusApplet(unittest.TestCase):
         """
         res = self.run_node_json(js_harness)
 
-        # SM Descending: 90 -> 45 (tie broken by name: betabot then blender) -> 10
         self.assertEqual(res["sortBySmDesc"], ["AlphaGame", "betabot", "blender", "zeta-stream"])
-        # SM Ascending: 10 -> 45 -> 45 -> 90
         self.assertEqual(res["sortBySmAsc"], ["zeta-stream", "betabot", "blender", "AlphaGame"])
-        # Mem Descending: 8192 MiB (8 GB) -> 4.5 GB -> 2.0 GB -> 512 MB
         self.assertEqual(res["sortByMemDesc"], ["AlphaGame", "blender", "betabot", "zeta-stream"])
-        # Name Ascending: AlphaGame -> betabot -> blender -> zeta-stream
         self.assertEqual(res["sortByNameAsc"], ["AlphaGame", "betabot", "blender", "zeta-stream"])
-        # Name Descending: zeta-stream -> blender -> betabot -> AlphaGame
         self.assertEqual(res["sortByNameDesc"], ["zeta-stream", "blender", "betabot", "AlphaGame"])
 
     def test_vram_parsing_units(self):
@@ -291,7 +390,7 @@ class TestNvidiaStatusApplet(unittest.TestCase):
         self.assertEqual(res["valNull"], 0)
 
     # =========================================================================
-    # Issue #2: Process Filtering & Telemetry Parsing Tests
+    # Issue #2: Process Filtering & Telemetry Parsing Tests (100% from main.qml)
     # =========================================================================
 
     def test_user_process_filtering(self):
@@ -335,42 +434,29 @@ class TestNvidiaStatusApplet(unittest.TestCase):
 
     def test_telemetry_csv_parsing(self):
         """
-        Verify telemetry parsing:
+        Verify main.qml's actual parseTelemetryCsv() function:
         - Memory used and total
         - GPU temperature
         - Power draw floating-point values
         - Power draw [N/A] handling without producing NaN or crashes
         """
-        js_harness = """
-        function parseTelemetry(telemetryOut) {
-            let usedMb = 0, totalMb = 0, tempC = 0, powerW = null;
-            if (telemetryOut) {
-                const tFields = telemetryOut.split(",");
-                if (tFields.length >= 3) {
-                    usedMb = parseFloat(tFields[0].trim()) || 0;
-                    totalMb = parseFloat(tFields[1].trim()) || 0;
-                    tempC = parseInt(tFields[2].trim()) || 0;
-                    if (tFields.length >= 4) {
-                        const rawPwr = tFields[3].trim();
-                        if (rawPwr && rawPwr !== "[N/A]" && !isNaN(parseFloat(rawPwr))) {
-                            powerW = Math.round(parseFloat(rawPwr) * 10) / 10;
-                        }
-                    }
-                }
-            }
-            return { usedMb, totalMb, tempC, powerW };
-        }
+        parse_telemetry_fn = extract_js_function(self.main_qml_text, "parseTelemetryCsv")
 
-        const standard = parseTelemetry("1400.00, 16384.00, 46, 28.64");
-        const withNA = parseTelemetry("0.00, 8192.00, 40, [N/A]");
-        const lowPower = parseTelemetry("2.00, 16384.00, 34, 9.71");
+        js_harness = f"""
+        {parse_telemetry_fn}
 
-        console.log(JSON.stringify({ standard, withNA, lowPower }));
+        const standard = parseTelemetryCsv("1400.00, 16384.00, 46, 28.64");
+        const withNA = parseTelemetryCsv("0.00, 8192.00, 40, [N/A]");
+        const lowPower = parseTelemetryCsv("2.00, 16384.00, 34, 9.71");
+        const empty = parseTelemetryCsv("");
+
+        console.log(JSON.stringify({{ standard, withNA, lowPower, empty }}));
         """
         res = self.run_node_json(js_harness)
         self.assertEqual(res["standard"], {"usedMb": 1400, "totalMb": 16384, "tempC": 46, "powerW": 28.6})
         self.assertEqual(res["withNA"], {"usedMb": 0, "totalMb": 8192, "tempC": 40, "powerW": None})
         self.assertEqual(res["lowPower"], {"usedMb": 2, "totalMb": 16384, "tempC": 34, "powerW": 9.7})
+        self.assertIsNone(res["empty"])
 
     # =========================================================================
     # Recent Store Issue: RTX 5090 & Topology Auto-Detection Tests
@@ -469,11 +555,17 @@ class TestNvidiaStatusApplet(unittest.TestCase):
             self.assertEqual(parsed["model"], "RTX 5090")
 
     def test_rtx_5090_nvidia_smi_process_table_parsing(self):
-        """Verify nvidia-smi 595+ driver process table parsing with Ollama llama-server."""
-        regex_match = re.search(r"const\s+procRegex\s*=\s*(/.*?/);\s*$", self.main_qml_text, re.M)
-        self.assertIsNotNone(regex_match, "procRegex must exist in main.qml")
-        proc_regex_literal = regex_match.group(1)
+        """
+        Verify main.qml's actual parseProcessData() function end-to-end with
+        nvidia-smi 595+ driver output, pmon merging, path stripping, and utilization fallback.
+        """
+        is_user_proc_fn = extract_js_function(self.main_qml_text, "isUserProcess")
+        parse_proc_data_fn = extract_js_function(self.main_qml_text, "parseProcessData")
 
+        pmon_output = """# gpu         pid   type     sm    mem    enc    dec    jpg    ofa    command
+# Idx           #    C/G      %      %      %      %      %      %    name
+    0        6762      C     35     83      -      -      -      -    llama-server
+"""
         smi_output = """
 Thu Nov 5 10:29:53 2026
 +-----------------------------------------------------------------------------------------+
@@ -497,35 +589,40 @@ Thu Nov 5 10:29:53 2026
 +-----------------------------------------------------------------------------------------+
 """
         js_harness = f"""
-        const procRegex = {proc_regex_literal};
-        const smiLines = {json.dumps(smi_output)}.split("\\n");
-        const matches = [];
-        for (const line of smiLines) {{
-            const m = line.match(procRegex);
-            if (m) {{
-                let name = m[3].trim();
-                if (name.lastIndexOf("/") !== -1) {{
-                    name = name.substring(name.lastIndexOf("/") + 1);
-                }}
-                matches.push({{
-                    pid: m[1],
-                    type: m[2],
-                    name: name,
-                    vram: m[4].trim()
-                }});
-            }}
-        }}
-        console.log(JSON.stringify(matches));
+        const root = {{}};
+        {is_user_proc_fn}
+        {parse_proc_data_fn}
+        root.isUserProcess = isUserProcess;
+        root.parseProcessData = parseProcessData;
+
+        const resultWithPmon = parseProcessData({json.dumps(pmon_output)}, {json.dumps(smi_output)}, {{}});
+        const resultNoPmon = parseProcessData("", {json.dumps(smi_output)}, {{}});
+
+        console.log(JSON.stringify({{ resultWithPmon, resultNoPmon }}));
         """
-        matches = self.run_node_json(js_harness)
+        res = self.run_node_json(js_harness)
+
         self.assertEqual(
-            matches,
+            res["resultWithPmon"]["processes"],
             [
                 {
                     "pid": "6762",
                     "type": "C",
+                    "sm": "35",
+                    "mem": "20388MiB",
                     "name": "llama-server",
-                    "vram": "20388MiB",
+                }
+            ],
+        )
+        self.assertEqual(
+            res["resultNoPmon"]["processes"],
+            [
+                {
+                    "pid": "6762",
+                    "type": "C",
+                    "sm": "0",
+                    "mem": "20388MiB",
+                    "name": "llama-server",
                 }
             ],
         )

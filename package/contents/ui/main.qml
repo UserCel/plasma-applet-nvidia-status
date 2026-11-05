@@ -44,7 +44,7 @@ PlasmoidItem {
         const addr = root.configuredPciAddress;
         return addr ? " -i " + addr : "";
     }
-    readonly property string getProcessCmd: root.nvidiaSmiPath + " pmon -c 1" + root.smiTarget + "; echo \"---PROCESSES---\"; " + root.nvidiaSmiPath + root.smiTarget + "; echo \"---TELEMETRY---\"; " + root.nvidiaSmiPath + root.smiTarget + " --query-gpu=memory.used,memory.total,temperature.gpu,power.draw --format=csv,noheader,nounits"
+    readonly property string getProcessCmd: root.buildProcessCmd(root.nvidiaSmiPath, root.configuredPciAddress)
     property bool showGpuModel: plasmoid.configuration && plasmoid.configuration.showGpuModel !== undefined ? plasmoid.configuration.showGpuModel : true
     property string gpuModelName: ""
     property string detectedPciAddress: ""
@@ -55,7 +55,7 @@ PlasmoidItem {
         return addr.replace(/^0000:/, "");
     }
     readonly property string cardDisplayName: (root.showGpuModel && root.gpuModelName) ? (root.gpuModelName + " (" + root.shortPciAddress + ")") : ("GPU (" + root.shortPciAddress + ")")
-    readonly property string fuserCmd: "dev=\"/dev/nvidia$(grep -s 'Device Minor:' /proc/driver/nvidia/gpus/" + root.configuredPciAddress + "/information 2>/dev/null | awk '{print $NF}')\"; [ -e \"$dev\" ] || dev=\"/dev/nvidia0\"; fuser \"$dev\" /dev/nvidiactl /dev/nvidia-modeset 2>/dev/null"
+    readonly property string fuserCmd: root.buildFuserCmd(root.configuredPciAddress)
     property bool isBackingOff: false
     property var baselineFuserPids: []
     property int idleCooldownTicks: 0
@@ -141,6 +141,164 @@ PlasmoidItem {
         const cmd = root.buildGpuDetectCmd(root.rawConfiguredPciAddress);
         gpuModelSource.disconnectSource(cmd);
         gpuModelSource.connectSource(cmd);
+    }
+
+    function buildProcessCmd(smiPath, pciAddr) {
+        const addr = root.normalizePciAddress(pciAddr);
+        const target = addr ? " -i " + addr : "";
+        return smiPath + " pmon -c 1" + target + "; echo \"---PROCESSES---\"; " + smiPath + target + "; echo \"---TELEMETRY---\"; " + smiPath + target + " --query-gpu=memory.used,memory.total,temperature.gpu,power.draw --format=csv,noheader,nounits";
+    }
+
+    function buildFuserCmd(pciAddr) {
+        const addr = root.normalizePciAddress(pciAddr) || "0000:01:00.0";
+        return "dev=\"/dev/nvidia$(grep -s 'Device Minor:' /proc/driver/nvidia/gpus/" + addr + "/information 2>/dev/null | awk '{print $NF}')\"; [ -e \"$dev\" ] || dev=\"/dev/nvidia0\"; fuser \"$dev\" /dev/nvidiactl /dev/nvidia-modeset 2>/dev/null";
+    }
+
+    function parseTelemetryCsv(telemetryOut) {
+        if (!telemetryOut) return null;
+        const tFields = String(telemetryOut).trim().split(",");
+        if (tFields.length < 3) return null;
+        const usedMb = parseFloat(tFields[0].trim()) || 0;
+        const totalMb = parseFloat(tFields[1].trim()) || 0;
+        const tempC = parseInt(tFields[2].trim()) || 0;
+        let powerW = null;
+        if (tFields.length >= 4) {
+            const rawPwr = tFields[3].trim();
+            if (rawPwr && rawPwr !== "[N/A]" && !isNaN(parseFloat(rawPwr))) {
+                powerW = Math.round(parseFloat(rawPwr) * 10) / 10;
+            }
+        }
+        return { usedMb: usedMb, totalMb: totalMb, tempC: tempC, powerW: powerW };
+    }
+
+    function parseProcessData(pmonOut, smiOut, prevHistory) {
+        const historyIn = prevHistory || {};
+        // 1. Parse pmon data
+        const pmonMap = {};
+        const pmonLines = String(pmonOut || "").split("\n");
+        for (let i = 2; i < pmonLines.length; i++) {
+            const line = pmonLines[i].trim();
+            if (!line || line.startsWith("#")) continue;
+            const parts = line.split(/\s+/);
+            if (parts.length >= 10) {
+                const pid = parts[1];
+                const type = parts[2];
+                const sm = parts[3];
+                const mem = parts[4];
+                const name = parts.slice(9).join(" ").trim();
+                if (name && name !== "-") {
+                    pmonMap[pid] = { pid: pid, type: type, sm: sm, mem: mem, name: name };
+                }
+            }
+        }
+
+        // 2. Parse standard nvidia-smi process table data & overall GPU utilization
+        let overallGpuUtil = null;
+        const processMap = {};
+        const smiLines = String(smiOut || "").split("\n");
+        const procRegex = /\|\s*\d+\s+(?:N\/A|\d+)\s+(?:N\/A|\d+)\s+(\d+)\s+(\S+)\s+(.*?)\s+(\d+(?:\.\d+)?\s*(?:MiB|MB|GiB|GB))\s*\|/;
+
+        for (let i = 0; i < smiLines.length; i++) {
+            const line = smiLines[i];
+            if (line.indexOf("MiB /") !== -1 || line.indexOf("GiB /") !== -1 || line.indexOf("MB /") !== -1) {
+                const matchUtil = line.match(/\|\s*(\d+)%\s+(?:Default|Exclusive|Prohibited|Process)/);
+                if (matchUtil) {
+                    overallGpuUtil = parseFloat(matchUtil[1]);
+                }
+            }
+
+            const match = line.match(procRegex);
+            if (match) {
+                const pid = match[1];
+                const type = match[2];
+                let name = match[3].trim();
+                const vram = match[4].trim();
+
+                if (name.lastIndexOf("\\") !== -1) {
+                    name = name.substring(name.lastIndexOf("\\") + 1);
+                } else if (name.lastIndexOf("/") !== -1) {
+                    name = name.substring(name.lastIndexOf("/") + 1);
+                }
+
+                processMap[pid] = { pid: pid, type: type, name: name, vram: vram };
+            }
+        }
+
+        // If smiOut didn't return process lines, fallback to pmon processes
+        for (const pid in pmonMap) {
+            if (!processMap[pid]) {
+                processMap[pid] = {
+                    pid: pid,
+                    type: pmonMap[pid].type,
+                    name: pmonMap[pid].name,
+                    vram: pmonMap[pid].mem !== "-" ? pmonMap[pid].mem + "%" : "0 MB"
+                };
+            }
+        }
+
+        // Count active user processes
+        let totalUserProcs = 0;
+        for (const pid in processMap) {
+            if (root.isUserProcess(processMap[pid])) {
+                totalUserProcs++;
+            }
+        }
+
+        // 3. Build merged process list with smoothing and overall GPU utilization fallback
+        const newHistory = {};
+        const finalProcesses = [];
+
+        for (const pid in processMap) {
+            const item = processMap[pid];
+            const pmonItem = pmonMap[pid];
+
+            let name = item.name;
+            if (pmonItem && pmonItem.name && pmonItem.name.length > 0 && name.indexOf("...") !== -1) {
+                name = pmonItem.name;
+            }
+
+            let rawSm = pmonItem ? pmonItem.sm : "-";
+            let smVal = (rawSm === "-" || rawSm === undefined) ? null : parseFloat(rawSm);
+            if (isNaN(smVal)) smVal = null;
+
+            const key = pid;
+            const prev = historyIn[key];
+
+            let smGrace = 0;
+
+            if (smVal !== null && smVal > 0) {
+                smGrace = 0;
+            } else if (prev && prev.sm > 0 && prev.smGrace < 30) {
+                smVal = prev.sm;
+                smGrace = prev.smGrace + 1;
+            } else if (root.isUserProcess(item) && overallGpuUtil !== null && overallGpuUtil > 0) {
+                smVal = (totalUserProcs > 1) ? Math.round(overallGpuUtil / totalUserProcs) : overallGpuUtil;
+                smGrace = 0;
+            }
+
+            const finalSm = (smVal !== null && !isNaN(smVal)) ? smVal : 0;
+            const finalMem = item.vram || (pmonItem && pmonItem.mem !== "-" ? pmonItem.mem + "%" : "0 MB");
+
+            newHistory[key] = {
+                sm: finalSm,
+                smGrace: smGrace,
+                vram: finalMem
+            };
+
+            finalProcesses.push({
+                "pid": pid,
+                "type": item.type,
+                "sm": finalSm.toString(),
+                "mem": finalMem,
+                "name": name
+            });
+        }
+
+        return {
+            processes: finalProcesses,
+            history: newHistory,
+            overallGpuUtil: overallGpuUtil
+        };
     }
 
     function formatVramMb(mb) {
@@ -931,151 +1089,20 @@ PlasmoidItem {
                 const mainOut = partsOut[0] || "";
                 const telemetryOut = (partsOut[1] || "").trim();
 
-                if (telemetryOut) {
-                    const tFields = telemetryOut.split(",");
-                    if (tFields.length >= 3) {
-                        const usedMb = parseFloat(tFields[0].trim()) || 0;
-                        const totalMb = parseFloat(tFields[1].trim()) || 0;
-                        const tempC = parseInt(tFields[2].trim()) || 0;
-                        let powerW = null;
-                        if (tFields.length >= 4) {
-                            const rawPwr = tFields[3].trim();
-                            if (rawPwr && rawPwr !== "[N/A]" && !isNaN(parseFloat(rawPwr))) {
-                                powerW = Math.round(parseFloat(rawPwr) * 10) / 10;
-                            }
-                        }
-                        root.vramUsedMb = usedMb;
-                        root.vramTotalMb = totalMb;
-                        root.gpuTemp = tempC;
-                        root.gpuPowerDraw = powerW;
-                    }
+                const tParsed = root.parseTelemetryCsv(telemetryOut);
+                if (tParsed) {
+                    root.vramUsedMb = tParsed.usedMb;
+                    root.vramTotalMb = tParsed.totalMb;
+                    root.gpuTemp = tParsed.tempC;
+                    root.gpuPowerDraw = tParsed.powerW;
                 }
 
                 const procParts = mainOut.split("---PROCESSES---");
                 const pmonOut = procParts[0] || "";
                 const smiOut = procParts[1] || "";
 
-                // 1. Parse pmon data
-                const pmonMap = {};
-                const pmonLines = pmonOut.split("\n");
-                for (let i = 2; i < pmonLines.length; i++) {
-                    const line = pmonLines[i].trim();
-                    if (!line || line.startsWith("#")) continue;
-                    const parts = line.split(/\s+/);
-                    if (parts.length >= 10) {
-                        const pid = parts[1];
-                        const type = parts[2];
-                        const sm = parts[3];
-                        const mem = parts[4];
-                        const name = parts.slice(9).join(" ").trim();
-                        if (name && name !== "-") {
-                            pmonMap[pid] = { pid, type, sm, mem, name };
-                        }
-                    }
-                }
-
-                // 2. Parse standard nvidia-smi process table data & overall GPU utilization
-                let overallGpuUtil = null;
-                const processMap = {};
-                const smiLines = smiOut.split("\n");
-                const procRegex = /\|\s*\d+\s+(?:N\/A|\d+)\s+(?:N\/A|\d+)\s+(\d+)\s+(\S+)\s+(.*?)\s+(\d+(?:\.\d+)?\s*(?:MiB|MB|GiB|GB))\s*\|/;
-
-                for (let i = 0; i < smiLines.length; i++) {
-                    const line = smiLines[i];
-                    if (line.indexOf("MiB /") !== -1 || line.indexOf("GiB /") !== -1 || line.indexOf("MB /") !== -1) {
-                        const matchUtil = line.match(/\|\s*(\d+)%\s+(?:Default|Exclusive|Prohibited|Process)/);
-                        if (matchUtil) {
-                            overallGpuUtil = parseFloat(matchUtil[1]);
-                        }
-                    }
-
-                    const match = line.match(procRegex);
-                    if (match) {
-                        const pid = match[1];
-                        const type = match[2];
-                        let name = match[3].trim();
-                        const vram = match[4].trim();
-
-                        if (name.lastIndexOf("\\") !== -1) {
-                            name = name.substring(name.lastIndexOf("\\") + 1);
-                        } else if (name.lastIndexOf("/") !== -1) {
-                            name = name.substring(name.lastIndexOf("/") + 1);
-                        }
-
-                        processMap[pid] = { pid, type, name, vram };
-                    }
-                }
-
-                // If smiOut didn't return process lines, fallback to pmon processes
-                for (const pid in pmonMap) {
-                    if (!processMap[pid]) {
-                        processMap[pid] = {
-                            pid: pid,
-                            type: pmonMap[pid].type,
-                            name: pmonMap[pid].name,
-                            vram: pmonMap[pid].mem !== "-" ? pmonMap[pid].mem + "%" : "0 MB"
-                        };
-                    }
-                }
-
-                // Count active user processes
-                let totalUserProcs = 0;
-                for (const pid in processMap) {
-                    if (root.isUserProcess(processMap[pid])) {
-                        totalUserProcs++;
-                    }
-                }
-
-                // 3. Build merged process list with smoothing and overall GPU utilization fallback
-                const newHistory = {};
-                const finalProcesses = [];
-
-                for (const pid in processMap) {
-                    const item = processMap[pid];
-                    const pmonItem = pmonMap[pid];
-
-                    let name = item.name;
-                    if (pmonItem && pmonItem.name && pmonItem.name.length > 0 && name.indexOf("...") !== -1) {
-                        name = pmonItem.name;
-                    }
-
-                    let rawSm = pmonItem ? pmonItem.sm : "-";
-                    let smVal = (rawSm === "-" || rawSm === undefined) ? null : parseFloat(rawSm);
-                    if (isNaN(smVal)) smVal = null;
-
-                    const key = pid; // Use stable PID key
-                    const prev = root.processHistory[key];
-
-                    let smGrace = 0;
-
-                    if (smVal !== null && smVal > 0) {
-                        smGrace = 0;
-                    } else if (prev && prev.sm > 0 && prev.smGrace < 30) {
-                        smVal = prev.sm;
-                        smGrace = prev.smGrace + 1;
-                    } else if (root.isUserProcess(item) && overallGpuUtil !== null && overallGpuUtil > 0) {
-                        // Fallback: If pmon reports 0% for a active user process, use overall GPU utilization
-                        smVal = (totalUserProcs > 1) ? Math.round(overallGpuUtil / totalUserProcs) : overallGpuUtil;
-                        smGrace = 0;
-                    }
-
-                    const finalSm = (smVal !== null && !isNaN(smVal)) ? smVal : 0;
-                    const finalMem = item.vram || (pmonItem && pmonItem.mem !== "-" ? pmonItem.mem + "%" : "0 MB");
-
-                    newHistory[key] = {
-                        sm: finalSm,
-                        smGrace: smGrace,
-                        vram: finalMem
-                    };
-
-                    finalProcesses.push({
-                        "pid": pid,
-                        "type": item.type,
-                        "sm": finalSm.toString(),
-                        "mem": finalMem,
-                        "name": name
-                    });
-                }
+                const parsedProcs = root.parseProcessData(pmonOut, smiOut, root.processHistory);
+                const finalProcesses = parsedProcs.processes;
 
                 let userProcCount = 0;
                 for (let i = 0; i < finalProcesses.length; i++) {
@@ -1096,7 +1123,7 @@ PlasmoidItem {
                     root.baselineFuserPids = [];
                 }
 
-                root.processHistory = newHistory;
+                root.processHistory = parsedProcs.history;
                 root.rawGpuProcesses = finalProcesses;
             }
             disconnectSource(sourceName);
